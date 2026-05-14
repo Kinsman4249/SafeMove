@@ -17,10 +17,10 @@ SafeMove – safety-first recursive file move script.
 - Windows PowerShell 5.1 compatible
 
 .NOTES
-Version: 1.0.1
+Version: 1.0.2
 License: Apache-2.0
 
-CSV columns (the three columns added in 1.0.1 are appended at the end so
+CSV columns (the three columns added in 1.0.2 are appended at the end so
 existing parsers that rely on the original column positions do not break):
 
   Timestamp, DryRun, Action, Source, Destination, SizeGB, Note,
@@ -46,7 +46,7 @@ param (
     [double]$MaxSizeGB = 1.0
 )
 
-$ScriptVersion = '1.0.1'
+$ScriptVersion = '1.0.2'
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
