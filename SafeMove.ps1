@@ -10,7 +10,29 @@ SafeMove – safety-first recursive file move script.
 - Skips Google Drive placeholder files (.gdoc, .gsheet, etc.)
 - Supports native -WhatIf
 - Always logs actions to CSV (including -WhatIf)
+- Per-file exception handling: a single failure never aborts the run
+- Real-time CSV logging: each row is flushed to disk immediately, so the
+  log is fully recoverable if the script is interrupted, the host reboots,
+  or PowerShell is killed mid-move
 - Windows PowerShell 5.1 compatible
+
+.NOTES
+Version: 1.0.1
+License: Apache-2.0
+
+CSV columns (the three columns added in 1.0.1 are appended at the end so
+existing parsers that rely on the original column positions do not break):
+
+  Timestamp, DryRun, Action, Source, Destination, SizeGB, Note,
+  Status, ErrorType, ErrorMessage
+
+Status values:
+  OK          - operation completed successfully
+  DryRun      - logged but not performed (because of -WhatIf)
+  Skipped     - file deliberately skipped (oversize, cloud stub)
+  FileLocked  - source/destination was held by another process
+                (ERROR_SHARING_VIOLATION, HRESULT 0x80070020)
+  Failed      - any other exception (see ErrorType / ErrorMessage)
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -24,35 +46,78 @@ param (
     [double]$MaxSizeGB = 1.0
 )
 
+$ScriptVersion = '1.0.1'
+
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 # --- Initial setup
 $MaxSizeBytes = $MaxSizeGB * 1GB
-$ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
-$CsvLogPath  = Join-Path $ScriptDir ("SafeMove_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+$ScriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
+$CsvLogPath   = Join-Path $ScriptDir ("SafeMove_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
-$LogBuffer = New-Object System.Collections.Generic.List[object]
+# --- Real-time CSV writer
+# AutoFlush = $true guarantees the log on disk is always current. If the
+# script is interrupted (Ctrl-C, host reboot, OOM kill), every row that
+# Write-Log has produced so far is already on disk.
+$CsvHeader = 'Timestamp,DryRun,Action,Source,Destination,SizeGB,Note,Status,ErrorType,ErrorMessage'
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$CsvWriter = New-Object System.IO.StreamWriter($CsvLogPath, $false, $Utf8NoBom)
+$CsvWriter.AutoFlush = $true
+$CsvWriter.WriteLine($CsvHeader)
 
-# --- Logging helper
+# --- CSV field escaping (RFC 4180: quote-wrap, double any internal quotes)
+function Format-CsvField {
+    param ([object]$Value)
+    if ($null -eq $Value) { return '""' }
+    $s = [string]$Value
+    return '"' + $s.Replace('"', '""') + '"'
+}
+
+# --- Logging helper (writes one row immediately and flushes)
 function Write-Log {
     param (
         [string]$Action,
-        [string]$SourcePath,
-        [string]$DestinationPath,
-        [double]$SizeGB,
-        [string]$Note
+        [string]$SourcePath      = '',
+        [string]$DestinationPath = '',
+        [double]$SizeGB          = 0,
+        [string]$Note            = '',
+        [string]$Status          = '',
+        [string]$ErrorType       = '',
+        [string]$ErrorMessage    = ''
     )
 
-    $LogBuffer.Add([pscustomobject]@{
-        Timestamp   = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss.fff')
-        DryRun      = $WhatIfPreference
-        Action      = $Action
-        Source      = $SourcePath
-        Destination = $DestinationPath
-        SizeGB      = $SizeGB
-        Note        = $Note
-    })
+    $fields = @(
+        (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss.fff'),
+        [string]$WhatIfPreference,
+        $Action,
+        $SourcePath,
+        $DestinationPath,
+        $SizeGB,
+        $Note,
+        $Status,
+        $ErrorType,
+        $ErrorMessage
+    ) | ForEach-Object { Format-CsvField $_ }
+
+    $CsvWriter.WriteLine($fields -join ',')
+}
+
+# --- Detect "file in use" sharing-violation errors
+# ERROR_SHARING_VIOLATION = 0x80070020 = -2147024864 (signed Int32)
+# ERROR_LOCK_VIOLATION    = 0x80070021 = -2147024863 (signed Int32)
+function Test-FileLocked {
+    param ($Exception)
+    if ($null -eq $Exception) { return $false }
+    if ($Exception.PSObject.Properties['HResult']) {
+        if ($Exception.HResult -eq -2147024864 -or $Exception.HResult -eq -2147024863) {
+            return $true
+        }
+    }
+    if ($Exception.Message -match 'being used by another process|sharing violation') {
+        return $true
+    }
+    return $false
 }
 
 # --- Generate a non-colliding destination path
@@ -77,65 +142,168 @@ function Get-UniquePath {
     return $Candidate
 }
 
-# --- Ensure destination root exists
-if (-not (Test-Path -LiteralPath $Destination)) {
-    Write-Log 'CreateFolder' $null $Destination 0 'Create destination root'
+# ============================================================================
+# Main pipeline — wrapped end-to-end so nothing escapes without being logged.
+# Each block has its own try/catch; the outermost try/finally only exists to
+# guarantee the CSV writer is flushed and disposed.
+# ============================================================================
+try {
 
-    if ($PSCmdlet.ShouldProcess($Destination, 'Create destination root')) {
-        New-Item -ItemType Directory -Path $Destination | Out-Null
-    }
-}
+    Write-Log -Action 'StartRun' -SourcePath $Source -DestinationPath $Destination `
+              -Note "SafeMove v$ScriptVersion (MaxSizeGB=$MaxSizeGB)" -Status 'OK'
 
-# --- Create directory structure safely
-Get-ChildItem -LiteralPath $Source -Directory -Recurse | ForEach-Object {
-    $Relative = $_.FullName.Substring($Source.Length).TrimStart('\')
-    $DestDir  = Join-Path $Destination $Relative
-
-    if (-not (Test-Path -LiteralPath $DestDir)) {
-        Write-Log 'CreateFolder' $_.FullName $DestDir 0 'Create directory'
-
-        if ($PSCmdlet.ShouldProcess($DestDir, 'Create directory')) {
-            New-Item -ItemType Directory -Path $DestDir | Out-Null
+    # --- Ensure destination root exists
+    try {
+        if (-not (Test-Path -LiteralPath $Destination)) {
+            if ($PSCmdlet.ShouldProcess($Destination, 'Create destination root')) {
+                New-Item -ItemType Directory -Path $Destination -ErrorAction Stop | Out-Null
+                Write-Log -Action 'CreateFolder' -DestinationPath $Destination `
+                          -Note 'Create destination root' -Status 'OK'
+            } else {
+                Write-Log -Action 'CreateFolder' -DestinationPath $Destination `
+                          -Note 'Create destination root' -Status 'DryRun'
+            }
         }
     }
+    catch {
+        $exc = $_.Exception
+        Write-Log -Action 'CreateFolder' -DestinationPath $Destination `
+                  -Note 'Create destination root' -Status 'Failed' `
+                  -ErrorType $exc.GetType().FullName -ErrorMessage $exc.Message
+    }
+
+    # --- Enumerate source directories (per-item errors are captured, not fatal)
+    $enumDirErrors = @()
+    $SourceDirs = @(Get-ChildItem -LiteralPath $Source -Directory -Recurse `
+                                  -ErrorAction SilentlyContinue `
+                                  -ErrorVariable enumDirErrors)
+
+    foreach ($err in $enumDirErrors) {
+        $exc = $err.Exception
+        $tgt = if ($err.TargetObject) { [string]$err.TargetObject } else { '' }
+        Write-Log -Action 'EnumerateDirectories' -SourcePath $tgt -Status 'Failed' `
+                  -ErrorType $exc.GetType().FullName -ErrorMessage $exc.Message
+    }
+
+    # --- Recreate directory structure safely
+    foreach ($Dir in $SourceDirs) {
+        $DestDir = $null
+        try {
+            $Relative = $Dir.FullName.Substring($Source.Length).TrimStart('\')
+            $DestDir  = Join-Path $Destination $Relative
+
+            if (-not (Test-Path -LiteralPath $DestDir)) {
+                if ($PSCmdlet.ShouldProcess($DestDir, 'Create directory')) {
+                    New-Item -ItemType Directory -Path $DestDir -ErrorAction Stop | Out-Null
+                    Write-Log -Action 'CreateFolder' -SourcePath $Dir.FullName `
+                              -DestinationPath $DestDir -Note 'Create directory' -Status 'OK'
+                } else {
+                    Write-Log -Action 'CreateFolder' -SourcePath $Dir.FullName `
+                              -DestinationPath $DestDir -Note 'Create directory' -Status 'DryRun'
+                }
+            }
+        }
+        catch {
+            $exc = $_.Exception
+            Write-Log -Action 'CreateFolder' -SourcePath $Dir.FullName -DestinationPath $DestDir `
+                      -Note 'Create directory' -Status 'Failed' `
+                      -ErrorType $exc.GetType().FullName -ErrorMessage $exc.Message
+        }
+    }
+
+    # --- Enumerate source files (per-item errors are captured, not fatal)
+    $enumFileErrors = @()
+    $SourceFiles = @(Get-ChildItem -LiteralPath $Source -File -Recurse `
+                                   -ErrorAction SilentlyContinue `
+                                   -ErrorVariable enumFileErrors)
+
+    foreach ($err in $enumFileErrors) {
+        $exc = $err.Exception
+        $tgt = if ($err.TargetObject) { [string]$err.TargetObject } else { '' }
+        Write-Log -Action 'EnumerateFiles' -SourcePath $tgt -Status 'Failed' `
+                  -ErrorType $exc.GetType().FullName -ErrorMessage $exc.Message
+    }
+
+    # --- Process files
+    foreach ($File in $SourceFiles) {
+        $SourceFullName = ''
+        $Final          = ''
+        $SizeGB         = 0
+        $Note           = ''
+
+        try {
+            $SourceFullName = $File.FullName
+            $SizeGB         = [math]::Round($File.Length / 1GB, 6)
+
+            # Skip oversized files
+            if ($File.Length -gt $MaxSizeBytes) {
+                Write-Log -Action 'Move' -SourcePath $SourceFullName -SizeGB $SizeGB `
+                          -Note "Exceeds MaxSizeGB ($MaxSizeGB)" -Status 'Skipped'
+                continue
+            }
+
+            # Skip Google Drive placeholder files (cause Move-Item IO errors)
+            if ($File.Extension -in '.gdoc', '.gsheet', '.gslides', '.gdraw', '.gtable') {
+                Write-Log -Action 'Move' -SourcePath $SourceFullName -SizeGB $SizeGB `
+                          -Note 'Google Drive placeholder file' -Status 'Skipped'
+                continue
+            }
+
+            $Relative = $SourceFullName.Substring($Source.Length).TrimStart('\')
+            $Target   = Join-Path $Destination $Relative
+            $Final    = Get-UniquePath $Target
+
+            $Note = if ($Final -ne $Target) {
+                'Renamed to avoid overwrite'
+            } else {
+                'No collision'
+            }
+
+            # --- The actual move, with explicit handling for sharing violations
+            try {
+                if ($PSCmdlet.ShouldProcess($SourceFullName, "Move to $Final")) {
+                    Move-Item -LiteralPath $SourceFullName -Destination $Final -ErrorAction Stop
+                    Write-Log -Action 'Move' -SourcePath $SourceFullName -DestinationPath $Final `
+                              -SizeGB $SizeGB -Note $Note -Status 'OK'
+                } else {
+                    Write-Log -Action 'Move' -SourcePath $SourceFullName -DestinationPath $Final `
+                              -SizeGB $SizeGB -Note $Note -Status 'DryRun'
+                }
+            }
+            catch {
+                $exc = $_.Exception
+                $status = if (Test-FileLocked $exc) { 'FileLocked' } else { 'Failed' }
+                Write-Log -Action 'Move' -SourcePath $SourceFullName -DestinationPath $Final `
+                          -SizeGB $SizeGB -Note $Note -Status $status `
+                          -ErrorType $exc.GetType().FullName -ErrorMessage $exc.Message
+            }
+        }
+        catch {
+            # Catch-all for anything in this iteration not already handled
+            # (sizing, path math, collision lookup, ShouldProcess weirdness, etc.)
+            $exc = $_.Exception
+            Write-Log -Action 'Move' -SourcePath $SourceFullName -DestinationPath $Final `
+                      -SizeGB $SizeGB -Note 'Unhandled iteration error' -Status 'Failed' `
+                      -ErrorType $exc.GetType().FullName -ErrorMessage $exc.Message
+        }
+    }
+
+    Write-Log -Action 'EndRun' -Status 'OK' -Note "SafeMove v$ScriptVersion completed"
 }
-
-# --- Process files
-Get-ChildItem -LiteralPath $Source -File -Recurse | ForEach-Object {
-
-    $SizeGB = [math]::Round($_.Length / 1GB, 6)
-
-    # Skip oversized files
-    if ($_.Length -gt $MaxSizeBytes) {
-        Write-Log 'SkippedSize' $_.FullName '' $SizeGB "Exceeds MaxSizeGB ($MaxSizeGB)"
-        return
-    }
-
-    # Skip Google Drive placeholder files (cause Move-Item IO errors)
-    if ($_.Extension -in '.gdoc', '.gsheet', '.gslides', '.gdraw', '.gtable') {
-        Write-Log 'SkippedCloudStub' $_.FullName '' $SizeGB 'Google Drive placeholder file'
-        return
-    }
-
-    $Relative = $_.FullName.Substring($Source.Length).TrimStart('\')
-    $Target   = Join-Path $Destination $Relative
-    $Final    = Get-UniquePath $Target
-
-    $Note = if ($Final -ne $Target) {
-        'Renamed to avoid overwrite'
-    } else {
-        'No collision'
-    }
-
-    Write-Log 'MovePlanned' $_.FullName $Final $SizeGB $Note
-
-    if ($PSCmdlet.ShouldProcess($_.FullName, "Move to $Final")) {
-        Move-Item -LiteralPath $_.FullName -Destination $Final
+catch {
+    # Top-level safety net. Every block above already catches its own errors,
+    # so this should almost never fire — but if it does, we still log it.
+    $exc = $_.Exception
+    Write-Log -Action 'FatalError' -Status 'Failed' `
+              -ErrorType $exc.GetType().FullName -ErrorMessage $exc.Message `
+              -Note 'Top-level catch fired'
+}
+finally {
+    if ($CsvWriter) {
+        try { $CsvWriter.Flush() }   catch { }
+        try { $CsvWriter.Dispose() } catch { }
     }
 }
-
-# --- Write CSV log
-$LogBuffer | Export-Csv -Path $CsvLogPath -NoTypeInformation -Encoding UTF8
 
 Write-Host "Completed. CSV log written to:" -ForegroundColor Green
 Write-Host $CsvLogPath
